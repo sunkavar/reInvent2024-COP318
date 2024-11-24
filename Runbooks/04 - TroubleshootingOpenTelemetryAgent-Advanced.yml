@@ -1,0 +1,155 @@
+schemaVersion: '0.3'
+description: |-
+  Troubleshoot OpenTelemetry (OTEL) agent on Linux and Windows
+  https://github.com/aws-observability/aws-otel-collector/blob/main/docs/developers/windows-other-demo.md
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Optional) The ARN of the IAM role that Automation uses to perform actions on your behalf.
+    default: arn:aws:iam::<AccountID>:role/SystemsManagerRoleForEC2
+  InstanceId:
+    type: String
+    description: (Required) The ID of the instance.
+  SlackWebhooks:
+    type: StringList
+    description: (Optional) A list of Slack webhooks to send notifications to.
+    default:
+      - NotificationToDevOpsAdmins
+      - NotificationToEndClient
+  Message:
+    type: String
+    description: (Optional) A message to include in the notification.
+    default: Approval to troubeshoot ADOT agent in the faulty instances.
+variables:
+  CurrentPlatform:
+    type: String
+    description: Save the instance platform name in a variable
+mainSteps:
+  - name: Approve
+    action: aws:approve
+    timeoutSeconds: 1000
+    nextStep: DescribeInstances
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Approvers:
+        - arn:aws:iam::<AccountID>:role/DevOpsAdmin
+        - arn:aws:iam::<AccountID>:role/EscalationEngineers
+      NotificationArn: arn:aws:sns:us-east-1:<AccountID>:IncidentAlert
+      MinRequiredApprovals: 1
+      Message: '{{ Message }}'
+  - name: DescribeInstances
+    action: aws:executeAwsApi
+    nextStep: UpdatePlatformName
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeInstances
+      InstanceIds:
+        - '{{InstanceId}}'
+    outputs:
+      - Name: RootVolumeId
+        Selector: $.Reservations..BlockDeviceMappings[?(@.DeviceName == '/dev/sda1')].Ebs.VolumeId
+        Type: String
+      - Name: Platform
+        Selector: $.Reservations[0].Instances[0].PlatformDetails
+        Type: String
+  - name: UpdatePlatformName
+    action: aws:updateVariable
+    nextStep: CreateSnapshot
+    isEnd: false
+    inputs:
+      Name: variable:CurrentPlatform
+      Value: ' {{ DescribeInstances.Platform}} '
+  - name: CreateSnapshot
+    action: aws:executeAwsApi
+    nextStep: WaitForSnapshotCompletion
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: CreateSnapshot
+      VolumeId: '{{DescribeInstances.RootVolumeId}}'
+    outputs:
+      - Name: SnapshotId
+        Selector: $.SnapshotId
+        Type: String
+  - name: WaitForSnapshotCompletion
+    action: aws:waitForAwsResourceProperty
+    nextStep: ChooseOSforCommands
+    isEnd: false
+    onFailure: Abort
+    inputs:
+      Service: ec2
+      Api: DescribeSnapshots
+      SnapshotIds:
+        - '{{CreateSnapshot.SnapshotId}}'
+      PropertySelector: $.Snapshots[0].State
+      DesiredValues:
+        - completed
+  - name: ChooseOSforCommands
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: runPowerShellCommand
+          Variable: '{{DescribeInstances.Platform}}'
+          StringEquals: Windows
+      Default: runShellCommand
+  - name: runShellCommand
+    action: aws:runCommand
+    nextStep: SendUpdatestoMultipleSlackChannels
+    isEnd: false
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        commands:
+          - '#!/bin/bash'
+          - ''
+          - ctlScript="/opt/aws/aws-otel-collector/bin/aws-otel-collector-ctl"
+          - status=$(sudo $ctlScript -a status | python3 -c "import sys, json; print(json.load(sys.stdin)['status'])")
+          - ''
+          - if [ "$status" == "running" ]; then
+          - '    echo "AWSOTelCollector is running."'
+          - else
+          - '    echo "AWSOTelCollector is not running. Starting the collector agent"'
+          - '    sudo $ctlScript -a start'
+          - fi
+  - name: runPowerShellCommand
+    action: aws:runCommand
+    nextStep: SendUpdatestoMultipleSlackChannels
+    isEnd: false
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        commands:
+          - $ctlScript = 'C:\Program Files\Amazon\AWSOTelCollector\aws-otel-collector-ctl.ps1'
+          - $status = (& $ctlScript -a status | ConvertFrom-Json).status
+          - ''
+          - if ($status -eq "running") {
+          - '    Write-Host "AWSOTelCollector is running."'
+          - '} else {'
+          - '    Write-Host "AWSOTelCollector is not running. Starting the collector agent"'
+          - '    & $ctlScript -a start'
+          - '}'
+  - name: SendUpdatestoMultipleSlackChannels
+    action: aws:loop
+    isEnd: true
+    inputs:
+      Iterators: '{{ SlackWebhooks }}'
+      IteratorDataType: String
+      Steps:
+        - name: sendSlackMessage
+          action: aws:invokeWebhook
+          isEnd: true
+          inputs:
+            IntegrationName: '{{ SendUpdatestoMultipleSlackChannels.CurrentIteratorValue }}'
+            Body: |-
+              {
+                "Text": "The automation {{automation:EXECUTION_ID}} completed the troubleshooting of the ADOT agent on the {{ variable:CurrentPlatform }} node {{InstanceId}}."
+              }

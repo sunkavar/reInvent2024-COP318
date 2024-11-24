@@ -1,0 +1,32 @@
+schemaVersion: '0.3'
+description: |-
+  Troubleshoot OpenTelemetry (OTEL) agent on Linux and Windows
+  https://github.com/aws-observability/aws-otel-collector/blob/main/docs/developers/windows-other-demo.md
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: (Optional) The ARN of the IAM role that Automation uses to perform actions on your behalf.
+    default: ''
+  InstanceId:
+    type: String
+    description: (Required) The ID of the instance.
+mainSteps:
+  - name: runPowerShellCommand
+    action: aws:runCommand
+    isEnd: true
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{ InstanceId }}'
+      Parameters:
+        commands:
+          - $ctlScript = 'C:\Program Files\Amazon\AWSOTelCollector\aws-otel-collector-ctl.ps1'
+          - $status = (& $ctlScript -a status | ConvertFrom-Json).status
+          - ''
+          - if ($status -eq "running") {
+          - '    Write-Host "AWSOTelCollector is running."'
+          - '} else {'
+          - '    Write-Host "AWSOTelCollector is not running. Starting..."'
+          - '    & $ctlScript -a start'
+          - '}'
